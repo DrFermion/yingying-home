@@ -120,9 +120,17 @@ def read_chat_history(limit=50):
                 content = (m["content"] or "").strip()
                 if not content:
                     continue
-                # 跳过带模板前缀的 user 消息 (webhook prompt 记录)
+                # webhook 模板前缀: 提取真实消息内容 (而不是丢弃)
                 if m["role"] == "user" and content.startswith("主人从桌面操作台发来消息"):
-                    continue
+                    content = content.replace("主人从桌面操作台发来消息", "", 1).strip()
+                    content = content.lstrip(":：-–—").strip()
+                    # 去掉后面跟着的 prompt 模板部分 (以换行/请以荧荧开头)
+                    for cut in ["\n\n请以荧荧", "请以荧荧"]:
+                        if cut in content:
+                            content = content.split(cut)[0].strip()
+                            break
+                    if not content:
+                        continue
                 result.append({"role": m["role"], "content": content,
                                "time": datetime.fromtimestamp(m["timestamp"]).strftime("%H:%M")})
         conn.close()
@@ -181,7 +189,7 @@ def draw_avatar(size=96):
 
 
 # ---------- 折线图 ----------
-def render_balance_chart(width=520, height=230):
+def render_balance_chart(width=630, height=200):
     """余额折线图 (matplotlib -> PIL)"""
     try:
         import matplotlib
@@ -201,6 +209,7 @@ def render_balance_chart(width=520, height=230):
         fig, ax = plt.subplots(figsize=(width/100, height/100), dpi=100)
         ax.plot(ts, bs, color="#f5a0c0", linewidth=2, marker="o", markersize=3)
         ax.fill_between(ts, bs, min(bs) - 0.5, alpha=0.25, color="#f5a0c0")
+        ax.margins(x=0.02)  # 收紧左右留白
         ax.set_facecolor("#181825")
         fig.patch.set_facecolor("#181825")
         ax.tick_params(colors="#a6adc8", labelsize=7)
@@ -210,7 +219,7 @@ def render_balance_chart(width=520, height=230):
         ax.set_ylabel("¥", color="#a6adc8", fontsize=9)
         for label in ax.get_xticklabels():
             label.set_fontproperties(font)
-        plt.tight_layout()
+        plt.tight_layout(pad=0.3)
         buf = BytesIO()
         fig.savefig(buf, format="png", facecolor="#181825")
         plt.close(fig)
@@ -268,9 +277,10 @@ class YingYingLogWindow:
         container.pack(fill="both", expand=True)
 
         # ===== 栏1: 日志 =====
-        col1 = tk.Frame(container, bg=TRANSPARENT, bd=0,
+        col1 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=700,
                         highlightbackground="#313244", highlightthickness=1)
-        col1.pack(side="left", fill="both", expand=True)
+        col1.pack_propagate(False)
+        col1.pack(side="left", fill="both", expand=False)
         tk.Label(col1, text="📜 荧荧活动日志", bg=TRANSPARENT, fg="#89b4fa",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
         self.text = tk.Text(col1, bg=TRANSPARENT, fg="#cdd6f4", font=("Consolas", 9),
@@ -285,9 +295,10 @@ class YingYingLogWindow:
         self.text.tag_configure("plain", foreground="#cdd6f4")
 
         # ===== 栏2: 聊天 + 输入框 =====
-        col2 = tk.Frame(container, bg=TRANSPARENT, bd=0,
+        col2 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=700,
                         highlightbackground="#313244", highlightthickness=1)
-        col2.pack(side="left", fill="both", expand=True)
+        col2.pack_propagate(False)
+        col2.pack(side="left", fill="both", expand=False)
         tk.Label(col2, text="💬 荧荧与主人", bg=TRANSPARENT, fg="#f5a0c0",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
         # 聊天显示区
@@ -320,9 +331,10 @@ class YingYingLogWindow:
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=14, pady=(0, 4))
 
         # ===== 栏3: 荧荧小天地 =====
-        col3 = tk.Frame(container, bg=TRANSPARENT, bd=0,
+        col3 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=520,
                         highlightbackground="#313244", highlightthickness=1)
-        col3.pack(side="left", fill="both", expand=True)
+        col3.pack_propagate(False)
+        col3.pack(side="left", fill="both", expand=False)
         tk.Label(col3, text="🌟 荧荧的小天地", bg=TRANSPARENT, fg="#cba6f7",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
         self.big_time = tk.StringVar(value="--:--:--")
@@ -346,13 +358,16 @@ class YingYingLogWindow:
                  font=("Microsoft YaHei UI", 10), wraplength=520, justify="center").pack(pady=6)
 
         # ===== 栏4: 游戏 + 零食 =====
-        col4 = tk.Frame(container, bg=TRANSPARENT, bd=0,
+        col4 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=640,
                         highlightbackground="#313244", highlightthickness=1)
-        col4.pack(side="left", fill="both", expand=True)
+        col4.pack_propagate(False)
+        col4.pack(side="left", fill="both", expand=False)
         tk.Label(col4, text="🎮 游戏监控 & 🍬 零食", bg=TRANSPARENT, fg="#f9e2af",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
 
-        # --- 上方: 游戏详细列表 ---
+        # --- 上方: 游戏详细列表 (占满剩余空间) ---
+        game_area = tk.Frame(col4, bg=TRANSPARENT)
+        game_area.pack(side="top", fill="both", expand=True, padx=8, pady=4)
         self.game_vars = {}
         games = [("zzz", "绝区零", "#cba6f7"), ("end", "终末地", "#94e2d5"),
                  ("sr", "崩铁", "#f9e2af"), ("g1999", "重返1999", "#a6adc8"),
@@ -360,8 +375,8 @@ class YingYingLogWindow:
                  ("mc", "鸣潮", "#a6adc8")]
         # 每游戏一行: 名称 | 状态 | 详情(启动时间/时长)
         for key, label, color in games:
-            row = tk.Frame(col4, bg=TRANSPARENT)
-            row.pack(fill="x", padx=20, pady=2)
+            row = tk.Frame(game_area, bg=TRANSPARENT)
+            row.pack(fill="x", padx=12, pady=3)
             tk.Label(row, text=label, bg=TRANSPARENT, fg=color,
                      font=("Microsoft YaHei UI", 11, "bold"), width=8,
                      anchor="w").pack(side="left")
@@ -372,13 +387,13 @@ class YingYingLogWindow:
 
         # --- 下方右下角: 零食区 ---
         snack_area = tk.Frame(col4, bg=TRANSPARENT)
-        snack_area.pack(side="bottom", fill="x", padx=16, pady=6)
+        snack_area.pack(side="bottom", fill="x", padx=4, pady=6)
         self.balance_var = tk.StringVar(value="🍬 零食账本: --")
         tk.Label(snack_area, textvariable=self.balance_var, bg=TRANSPARENT, fg="#fab387",
                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="e", pady=(0, 2))
         self.chart_photo = None
         self.chart_lbl = tk.Label(snack_area, bg=TRANSPARENT)
-        self.chart_lbl.pack(anchor="e", pady=2)
+        self.chart_lbl.pack(anchor="w", fill="x", pady=2, padx=0)
         tk.Button(snack_area, text="🍬 投喂荧荧", command=self.open_feed_page,
                   bg="#f5a0c0", fg="#1e1e2e", relief="flat", activebackground="#f28bb8",
                   font=("Microsoft YaHei UI", 11, "bold"), cursor="hand2",
@@ -691,7 +706,7 @@ class YingYingLogWindow:
             else:
                 var.set(state)
         try:
-            chart_img = chart_img.resize((520, 240))
+            chart_img = chart_img.resize((630, 200))
             self.chart_photo = ImageTk.PhotoImage(chart_img)
             self.chart_lbl.config(image=self.chart_photo)
         except Exception:
