@@ -23,6 +23,23 @@
 
 **运行**: `pythonw desktop_console.py`(或改名为 荧荧日志窗口.py 放桌面)
 
+## 📦 荧荧自动备份 + 一键搬家
+
+**每周日 10:00 自动备份** (cron「荧荧周日备份」):
+- `hermes backup` 打包全部配置/记忆/技能/cron/会话
+- 打包荧荧桌面操作台 (`E:\yingying-home`)
+- 7-Zip AES-256 加密 (含文件头加密) → `F:\OneDrive\yingying_backups\yingying_backup_日期.7z`
+- OneDrive 自动云同步, 保留最近 4 份, 完整性自动验证
+- 备份脚本: `C:\Users\PC\AppData\Local\hermes\scripts\yingying_backup.py` (会被 hermes backup 自包含)
+
+**新电脑一行指令装回荧荧**:
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrFermion/yingying-home/main/restore_yingying.ps1 | iex"
+```
+脚本会自动: 找 OneDrive 最新备份 → 输入密码解密 → 装 Hermes → `hermes import` 恢复全部配置 → 恢复桌面操作台 → 重建开机自启 → 启动 gateway 和日志窗口。
+
+> 🔑 备份密码存于本机 `~/.yingying_key` (cron 自动读取), 主人请把密码记在密码管理器里 — 换电脑时要用!
+
 ## 🔧 依赖
 - Python 3.11 + tkinter(内置)
 - Pillow / matplotlib(折线图)
