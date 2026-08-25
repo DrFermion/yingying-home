@@ -480,16 +480,20 @@ class YingYingLogWindow:
         # --- 下方右下角: 零食区 ---
         snack_area = tk.Frame(col4, bg=TRANSPARENT)
         snack_area.pack(side="bottom", fill="x", padx=4, pady=6)
-        self.balance_var = tk.StringVar(value="🍬 零食账本: --")
-        tk.Label(snack_area, textvariable=self.balance_var, bg=TRANSPARENT, fg="#fab387",
-                 font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="e", pady=(0, 2))
         self.chart_photo = None
         self.chart_lbl = tk.Label(snack_area, bg=TRANSPARENT)
         self.chart_lbl.pack(anchor="w", fill="x", pady=2, padx=0)
-        tk.Button(snack_area, text="🍬 投喂荧荧", command=self.open_feed_page,
+        # 最下面一行: 左边零食账本文字, 右边投喂按钮
+        snack_row = tk.Frame(snack_area, bg=TRANSPARENT)
+        snack_row.pack(fill="x", pady=4)
+        self.balance_var = tk.StringVar(value="🍬 零食账本: --")
+        tk.Label(snack_row, textvariable=self.balance_var, bg=TRANSPARENT, fg="#fab387",
+                 font=("Microsoft YaHei UI", 12, "bold"), anchor="w"
+                 ).pack(side="left", fill="x", expand=True)
+        tk.Button(snack_row, text="🍬 投喂荧荧", command=self.open_feed_page,
                   bg="#f5a0c0", fg="#1e1e2e", relief="flat", activebackground="#f28bb8",
                   font=("Microsoft YaHei UI", 11, "bold"), cursor="hand2",
-                  bd=0, padx=14, pady=6).pack(anchor="e", pady=4)
+                  bd=0, padx=14, pady=6).pack(side="right")
 
         # 初始加载
         self.reload_history()
