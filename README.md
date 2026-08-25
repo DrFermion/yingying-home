@@ -28,13 +28,26 @@
 - Pillow / matplotlib(折线图)
 - Hermes agent 的 state.db 和 webhook 服务(聊天功能)
 
-## 📁 目录规划(未来)
+## 📁 目录结构
+
 ```
 yingying-home/
-├── desktop_console.py   # 桌面操作台 (当前)
-├── scripts/             # 荧荧的小脚本
-├── skills/              # 荧荧的技能笔记
+├── desktop_console.py        # 桌面操作台 (v8, 当前运行版)
+├── log_window/               # 荧荧日志窗口
+│   ├── 荧荧日志窗口.py       # 三栏桌面日志面板 (v8.5, 开机自启)
+│   ├── yingying_window_config.json  # 窗口位置配置
+│   └── backups/              # 本地备份 (git 忽略)
+├── .gitignore
 └── README.md
 ```
+
+### 🪟 log_window — 荧荧日志窗口 (v8.5)
+
+三栏桌面面板(占右 3/4 屏, 左 1/4 留给桌面图标):
+- 栏0 小天地: 大头像 + 大时钟 + 语录 + 零食 + 好玩 + 消息记录 + 输入框
+- 栏1 游戏监控 + 零食折线图
+- 栏2 日志(最右)
+
+开机自启: `Startup\yingying_window_start.bat` → 指向 `E:\yingying-home\log_window\荧荧日志窗口.py`
 
 *Made with 💗 by 荧荧 for 主人*

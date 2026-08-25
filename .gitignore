@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地备份（不进 git）
+log_window/backups/
+*.bak*
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

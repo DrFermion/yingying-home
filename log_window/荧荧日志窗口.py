@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-荧荧的桌面操作台 v8 (全屏四栏 + 透明背景 + 聊天输入)
-- 全屏四栏, 透明背景 (桌面图标透过显示)
-- 栏1: 完整活动日志
-- 栏2: QQ 风格聊天 + 输入框 (可对话)
-- 栏3: 荧荧小天地 (时钟/语录/好玩内容)
-- 栏4: 游戏状态 + 零食余额 + 折线图
+荧荧的桌面操作台 v8.5 (右侧 3/4 屏幕三栏 + 透明背景 + 聊天输入)
+- 窗口只占屏幕右侧 3/4 (左侧 1/4 留空给桌面图标), 内部三栏等宽
+- 栏0: 荧荧小天地 (时钟/语录/好玩内容, 荧荧自己玩) + 消息记录 + 输入框 (可对话)
+- 栏1: 游戏状态 + 零食余额 + 折线图
+- 栏2: 完整活动日志
 """
 import os
 import re
@@ -15,7 +14,7 @@ import sqlite3
 import subprocess
 import threading
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageTk
 
@@ -24,10 +23,40 @@ ENV_FILE = os.path.expandvars(r"%LOCALAPPDATA%\hermes\.env")
 STATE_DB = os.path.expandvars(r"%LOCALAPPDATA%\hermes\state.db")
 BALANCE_HISTORY = os.path.expandvars(r"%LOCALAPPDATA%\hermes\scripts\balance_history.json")
 GAME_HISTORY = os.path.expandvars(r"%LOCALAPPDATA%\hermes\scripts\game_history.json")
+ADB_PATH = r"F:\leidian\LDPlayer14\adb.exe"
 REFRESH_MS = 3000
 SCREEN_W, SCREEN_H = 2560, 1440
-COL_W = SCREEN_W // 4
+LEFT_GAP = SCREEN_W // 4  # 屏幕左侧 1/4 留给桌面图标, 窗口占右侧 3/4
 TRANSPARENT = "#010203"  # 透明色 (桌面图标透过显示)
+
+
+def _parse_elapsed(s):
+    """解析 ADB ps ELAPSED 列 ([[DD-]HH:]MM:SS) 为秒数; 失败返回 None"""
+    s = (s or "").strip()
+    try:
+        if "-" in s:
+            d, rest = s.split("-", 1)
+            return int(d) * 86400 + _parse_elapsed(rest)
+        parts = [int(x) for x in s.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_duration(secs):
+    """秒数 → 友好时长字符串"""
+    if secs is None:
+        return ""
+    if secs < 60:
+        return f"{secs}秒"
+    mins = int(secs // 60)
+    if mins < 60:
+        return f"{mins}分钟"
+    return f"{mins // 60}h{mins % 60}m"
 
 # ---------- 余额查询 ----------
 def query_live_balance():
@@ -128,7 +157,7 @@ def _clean_msg(m, webhook=False):
 
 
 def read_chat_history(limit=60):
-    """读取 QQ 会话 + 近期 webhook 会话, 合并后按真实时间戳排序并去重"""
+    """读取 QQ 会话 + 近期 webhook 会话, 合并后按真实时间戳排序并去重 (user/assistant 都去重)"""
     try:
         conn = sqlite3.connect(STATE_DB)
         conn.row_factory = sqlite3.Row
@@ -162,16 +191,20 @@ def read_chat_history(limit=60):
                 if item:
                     merged.append(item)
         conn.close()
-        # 3. 按真实时间戳排序 (跨会话交叉时顺序才不乱)
+        # 3. 只保留最近 48 小时内的消息 (旧消息不占名额, 根治"卡老消息")
+        now_ts = datetime.now().timestamp()
+        merged = [m for m in merged if now_ts - m["ts"] < 48 * 3600]
+        # 4. 按真实时间戳排序 (跨会话交叉时顺序才不乱)
         merged.sort(key=lambda x: x["ts"])
-        # 4. 去重: 桌面发送的消息会同时写入 QQ 会话和 webhook 会话 (内容相同、时间接近)
+        # 5. 去重: 桌面发送的消息会同时写入 QQ 会话和 webhook 会话;
+        #    同角色同内容且时间接近 (120秒内) 只留一条 — user 和 assistant 都去重
         deduped, seen = [], {}
         for m in merged:
-            if m["role"] == "user":
-                last = seen.get(m["content"])
-                if last is not None and m["ts"] - last < 120:
-                    continue
-                seen[m["content"]] = m["ts"]
+            key = (m["role"], m["content"])
+            last = seen.get(key)
+            if last is not None and m["ts"] - last < 120:
+                continue
+            seen[key] = m["ts"]
             deduped.append(m)
         return deduped[-limit:]
     except Exception:
@@ -282,7 +315,7 @@ class YingYingLogWindow:
         except Exception:
             pass
         self.root.configure(bg=TRANSPARENT)
-        self.root.geometry(f"{SCREEN_W}x{SCREEN_H}+0+0")
+        self.root.geometry(f"{SCREEN_W - LEFT_GAP}x{SCREEN_H}+{LEFT_GAP}+0")
         self.root.resizable(False, False)
 
         self._log_pos = {}
@@ -314,12 +347,16 @@ class YingYingLogWindow:
 
         container = tk.Frame(self.root, bg=TRANSPARENT)
         container.pack(fill="both", expand=True)
+        # 三栏等宽 grid 布局 (1:1:1 = 小天地+聊天 : 游戏+零食 : 日志), 对应屏幕右 3/4 的三等份
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1, uniform="yycol")
+        container.grid_columnconfigure(1, weight=1, uniform="yycol")
+        container.grid_columnconfigure(2, weight=1, uniform="yycol")
 
-        # ===== 栏1: 日志 =====
-        col1 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=700,
+        # ===== 栏2 (最右): 完整活动日志 =====
+        col1 = tk.Frame(container, bg=TRANSPARENT, bd=0,
                         highlightbackground="#313244", highlightthickness=1)
-        col1.pack_propagate(False)
-        col1.pack(side="left", fill="both", expand=False)
+        col1.grid(row=0, column=2, sticky="nsew")
         tk.Label(col1, text="📜 荧荧活动日志", bg=TRANSPARENT, fg="#89b4fa",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
         self.text = tk.Text(col1, bg=TRANSPARENT, fg="#cdd6f4", font=("Consolas", 9),
@@ -333,15 +370,58 @@ class YingYingLogWindow:
         self.text.tag_configure("info", foreground="#a6e3a1")
         self.text.tag_configure("plain", foreground="#cdd6f4")
 
-        # ===== 栏2: 聊天 + 输入框 =====
-        col2 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=700,
-                        highlightbackground="#313244", highlightthickness=1)
-        col2.pack_propagate(False)
-        col2.pack(side="left", fill="both", expand=False)
-        tk.Label(col2, text="💬 荧荧与主人", bg=TRANSPARENT, fg="#f5a0c0",
+        # ===== 栏0 (左): 上=荧荧小天地(自己玩), 下=消息记录+对话框 =====
+        col_mid = tk.Frame(container, bg=TRANSPARENT, bd=0,
+                           highlightbackground="#313244", highlightthickness=1)
+        col_mid.grid(row=0, column=0, sticky="nsew")
+        col_mid.rowconfigure(0, weight=1)
+        col_mid.rowconfigure(1, weight=1)
+        col_mid.columnconfigure(0, weight=1)
+
+        # --- 上半: 荧荧小天地 (给荧荧自己玩) ---
+        play_area = tk.Frame(col_mid, bg=TRANSPARENT)
+        play_area.grid(row=0, column=0, sticky="nsew")
+        tk.Label(play_area, text="🌟 荧荧的小天地", bg=TRANSPARENT, fg="#cba6f7",
+                 font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
+        tk.Frame(play_area, bg="#313244", height=1).pack(fill="x", side="bottom")  # 与聊天区分隔线
+        play_body = tk.Frame(play_area, bg=TRANSPARENT)
+        play_body.pack(fill="both", expand=True)
+        # 左半: 大头像 + 大时钟 + 日期
+        play_left = tk.Frame(play_body, bg=TRANSPARENT)
+        play_left.pack(side="left", fill="both", expand=True)
+        tk.Frame(play_left, bg=TRANSPARENT).pack(fill="both", expand=True)  # 上留白 (垂直居中)
+        avatar_img = draw_avatar(144)
+        self.avatar_photo = ImageTk.PhotoImage(avatar_img)
+        tk.Label(play_left, image=self.avatar_photo, bg=TRANSPARENT).pack(pady=(0, 12))
+        self.big_time = tk.StringVar(value="--:--")
+        tk.Label(play_left, textvariable=self.big_time, bg=TRANSPARENT, fg="#cdd6f4",
+                 font=("Consolas", 44, "bold")).pack(pady=(4, 0))
+        self.big_date = tk.StringVar(value="----")
+        tk.Label(play_left, textvariable=self.big_date, bg=TRANSPARENT, fg="#a6adc8",
+                 font=("Microsoft YaHei UI", 14)).pack(pady=(2, 0))
+        tk.Frame(play_left, bg=TRANSPARENT).pack(fill="both", expand=True)  # 下留白
+        # 右半: 语录 + 零食 + 好玩内容
+        play_right = tk.Frame(play_body, bg=TRANSPARENT)
+        play_right.pack(side="left", fill="both", expand=True)
+        tk.Frame(play_right, bg=TRANSPARENT).pack(fill="both", expand=True)
+        self.quote_var = tk.StringVar(value="荧荧会一直陪着主人哦~")
+        tk.Label(play_right, textvariable=self.quote_var, bg=TRANSPARENT, fg="#f5a0c0",
+                 font=("Microsoft YaHei UI", 14, "bold"), wraplength=280, justify="center").pack(pady=8)
+        self.snack_var = tk.StringVar(value="🍬 今日零食: 统计中...")
+        tk.Label(play_right, textvariable=self.snack_var, bg=TRANSPARENT, fg="#fab387",
+                 font=("Microsoft YaHei UI", 11)).pack(pady=12)
+        self.fun_var = tk.StringVar(value="✨")
+        tk.Label(play_right, textvariable=self.fun_var, bg=TRANSPARENT, fg="#94e2d5",
+                 font=("Microsoft YaHei UI", 11), wraplength=280, justify="center").pack(pady=8)
+        tk.Frame(play_right, bg=TRANSPARENT).pack(fill="both", expand=True)
+
+        # --- 下半: 消息记录 + 对话框 ---
+        chat_area = tk.Frame(col_mid, bg=TRANSPARENT)
+        chat_area.grid(row=1, column=0, sticky="nsew")
+        tk.Label(chat_area, text="💬 荧荧与主人", bg=TRANSPARENT, fg="#f5a0c0",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
         # 聊天显示区
-        chat_frame = tk.Frame(col2, bg=TRANSPARENT)
+        chat_frame = tk.Frame(chat_area, bg=TRANSPARENT)
         chat_frame.pack(fill="both", expand=True)
         self.chat = tk.Text(chat_frame, bg=TRANSPARENT, fg="#cdd6f4", font=("Microsoft YaHei UI", 10),
                             wrap="word", state="disabled", borderwidth=0, padx=10, pady=4)
@@ -354,7 +434,7 @@ class YingYingLogWindow:
         self.chat.tag_configure("time", foreground="#6c7086", font=("Microsoft YaHei UI", 8))
         self.chat.tag_configure("sep", foreground="#313244")
         # 输入区 (不透明背景, 否则透明色区域点击穿透无法选中)
-        input_frame = tk.Frame(col2, bg="#181825")
+        input_frame = tk.Frame(chat_area, bg="#181825")
         input_frame.pack(fill="x", side="bottom", pady=8, padx=10)
         self.chat_input = tk.Entry(input_frame, bg="#11111b", fg="#cdd6f4",
                                    font=("Microsoft YaHei UI", 11), insertbackground="#cdd6f4",
@@ -366,41 +446,13 @@ class YingYingLogWindow:
                   bg="#f5a0c0", fg="#1e1e2e", relief="flat", activebackground="#f28bb8",
                   font=("Microsoft YaHei UI", 11, "bold"), cursor="hand2",
                   bd=0, padx=16, pady=6).pack(side="left")
-        tk.Label(col2, text="(输入后发送, 荧荧会记在心里~)", bg=TRANSPARENT, fg="#6c7086",
+        tk.Label(chat_area, text="(输入后发送, 荧荧会记在心里~)", bg=TRANSPARENT, fg="#6c7086",
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=14, pady=(0, 4))
 
-        # ===== 栏3: 荧荧小天地 =====
-        col3 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=520,
+        # ===== 栏1 (中): 游戏 + 零食 =====
+        col4 = tk.Frame(container, bg=TRANSPARENT, bd=0,
                         highlightbackground="#313244", highlightthickness=1)
-        col3.pack_propagate(False)
-        col3.pack(side="left", fill="both", expand=False)
-        tk.Label(col3, text="🌟 荧荧的小天地", bg=TRANSPARENT, fg="#cba6f7",
-                 font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
-        self.big_time = tk.StringVar(value="--:--")
-        tk.Label(col3, textvariable=self.big_time, bg=TRANSPARENT, fg="#cdd6f4",
-                 font=("Consolas", 40, "bold")).pack(pady=(30, 0))
-        self.big_date = tk.StringVar(value="----")
-        tk.Label(col3, textvariable=self.big_date, bg=TRANSPARENT, fg="#a6adc8",
-                 font=("Microsoft YaHei UI", 14)).pack(pady=(2, 0))
-        avatar_img = draw_avatar(100)
-        self.avatar_photo = ImageTk.PhotoImage(avatar_img)
-        tk.Label(col3, image=self.avatar_photo, bg=TRANSPARENT).pack(pady=(20, 8))
-        self.quote_var = tk.StringVar(value="荧荧会一直陪着主人哦~")
-        tk.Label(col3, textvariable=self.quote_var, bg=TRANSPARENT, fg="#f5a0c0",
-                 font=("Microsoft YaHei UI", 11), wraplength=520, justify="center").pack(pady=6)
-        # 好玩的小玩意: 零食统计
-        self.snack_var = tk.StringVar(value="🍬 今日零食: 统计中...")
-        tk.Label(col3, textvariable=self.snack_var, bg=TRANSPARENT, fg="#fab387",
-                 font=("Microsoft YaHei UI", 10)).pack(pady=6)
-        self.fun_var = tk.StringVar(value="✨")
-        tk.Label(col3, textvariable=self.fun_var, bg=TRANSPARENT, fg="#94e2d5",
-                 font=("Microsoft YaHei UI", 10), wraplength=520, justify="center").pack(pady=6)
-
-        # ===== 栏4: 游戏 + 零食 =====
-        col4 = tk.Frame(container, bg=TRANSPARENT, bd=0, width=640,
-                        highlightbackground="#313244", highlightthickness=1)
-        col4.pack_propagate(False)
-        col4.pack(side="left", fill="both", expand=False)
+        col4.grid(row=0, column=1, sticky="nsew")
         tk.Label(col4, text="🎮 游戏监控 & 🍬 零食", bg=TRANSPARENT, fg="#f9e2af",
                  font=("Microsoft YaHei UI", 12, "bold"), pady=8).pack(fill="x")
 
@@ -549,123 +601,26 @@ class YingYingLogWindow:
         self.chat.configure(state="disabled")
         self.chat.see(tk.END)
         self._chat_loaded += 1
-        # 本地直连 DeepSeek API 获取荧荧回复 (不走 webhook, 无权限限制)
-        def direct_reply():
+        # 通过 webhook 发给荧荧 (agent 模式, 有完整工具权限)
+        def post():
             try:
+                import hashlib
+                import hmac
                 import json as _json
                 import urllib.request
-                # 1. 读 API key
-                key = ""
-                env_path = os.path.expandvars(r"%LOCALAPPDATA%\hermes\.env")
-                try:
-                    for line in open(env_path, encoding="utf-8"):
-                        if line.startswith("DEEPSEEK_API_KEY="):
-                            key = line.strip().split("=", 1)[1].strip().strip('"')
-                            break
-                except Exception:
-                    pass
-                if not key:
-                    return
-                # 2. 取最近聊天历史 (QQ 会话 + 桌面, 最多 20 条)
-                history = []
-                try:
-                    import sqlite3
-                    conn = sqlite3.connect(STATE_DB, timeout=10)
-                    conn.row_factory = sqlite3.Row
-                    row = conn.execute(
-                        "SELECT id FROM sessions WHERE source LIKE '%qq%' ORDER BY last_activity_at DESC LIMIT 1"
-                    ).fetchone()
-                    if row:
-                        rows = conn.execute(
-                            "SELECT role, content FROM messages WHERE session_id=? AND role IN ('user','assistant') "
-                            "AND content NOT LIKE '%untrusted_tool_result%' AND content NOT LIKE '%{\"output\"%' "
-                            "ORDER BY id DESC LIMIT 20", (row[0],)).fetchall()
-                        for m in reversed(rows):
-                            c = (m["content"] or "").strip()
-                            if not c:
-                                continue
-                            # webhook 模板前缀提取
-                            if m["role"] == "user" and c.startswith("主人从桌面操作台发来消息"):
-                                c = c.replace("主人从桌面操作台发来消息", "", 1).lstrip(":：-–—").strip()
-                                c = c.split("\n")[0].strip()
-                            history.append({"role": "user" if m["role"] == "user" else "assistant",
-                                            "content": c})
-                    conn.close()
-                except Exception:
-                    pass
-                history.append({"role": "user", "content": text})
-                if len(history) > 30:
-                    history = history[-30:]
-                # 3. 调用 DeepSeek (带荧荧人设)
-                sys_prompt = ("你是荧荧,主人的 AI 助手。性格傲娇可爱,称呼主人为'笨蛋主人'或'主人',"
-                              "说话带一点点傲娇(哼、才不是...),但内心很关心主人,用语自然不刻意。"
-                              "回复要简短(2-4句),温暖。不要用markdown格式,不要提'我是AI'。")
+                secret = "RDITjtnGZFulO1IIax63xQbURdXksUkaO79WqwnEAn4"
+                payload = _json.dumps({"message": text}).encode()
+                sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
                 req = urllib.request.Request(
-                    "https://api.deepseek.com/chat/completions",
-                    data=_json.dumps({
-                        "model": "deepseek-chat",
-                        "messages": [{"role": "system", "content": sys_prompt}] + history,
-                        "max_tokens": 500,
-                    }).encode(),
-                    headers={"Content-Type": "application/json",
-                             "Authorization": f"Bearer {key}"})
-                resp = urllib.request.urlopen(req, timeout=120)
-                d = _json.loads(resp.read())
-                reply = d["choices"][0]["message"]["content"].strip()
-                # 4. 写回 QQ 会话 (assistant, 标记桌面来源)
-                try:
-                    import sqlite3
-                    conn = sqlite3.connect(STATE_DB, timeout=10)
-                    cur = conn.cursor()
-                    row = cur.execute(
-                        "SELECT id FROM sessions WHERE source LIKE '%qq%' ORDER BY last_activity_at DESC LIMIT 1"
-                    ).fetchone()
-                    if row:
-                        cur.execute(
-                            "INSERT INTO messages (session_id, role, content, timestamp, active, observed) "
-                            "VALUES (?, 'assistant', ?, ?, 1, 0)",
-                            (row[0], reply, datetime.now().timestamp()))
-                        conn.commit()
-                    conn.close()
-                except Exception:
+                    "http://localhost:8644/webhooks/desktop-chat",
+                    data=payload, method="POST")
+                req.add_header("Content-Type", "application/json")
+                req.add_header("X-Hub-Signature-256", f"sha256={sig}")
+                with urllib.request.urlopen(req, timeout=15):
                     pass
-                # 5. 显示到聊天框 (主线程)
-                def show():
-                    self.chat.configure(state="normal")
-                    now = datetime.now().strftime("%H:%M")
-                    self.chat.insert(tk.END, f"  {now}\n", "time")
-                    self.chat.insert(tk.END, f"🤖 荧荧: {reply}\n", "assistant")
-                    self.chat.insert(tk.END, "─" * 30 + "\n", "sep")
-                    self.chat.configure(state="disabled")
-                    self.chat.see(tk.END)
-                self.root.after(0, show)
-                # 6. 写日志
-                try:
-                    path = os.path.join(LOG_DIR, "yingying_chat_log.txt")
-                    with open(path, "a", encoding="utf-8") as f:
-                        f.write(f"[{datetime.now().strftime('%H:%M')}] 荧荧(直连): {reply}\n")
-                except Exception:
-                    pass
-            except Exception as e:
-                # 直连失败 → 回退 webhook
-                try:
-                    import hashlib
-                    import hmac
-                    import json as _json
-                    import urllib.request
-                    secret = "RDITjtnGZFulO1IIax63xQbURdXksUkaO79WqwnEAn4"
-                    payload = _json.dumps({"message": text}).encode()
-                    sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-                    req = urllib.request.Request(
-                        "http://localhost:8644/webhooks/desktop-chat",
-                        data=payload, method="POST")
-                    req.add_header("Content-Type", "application/json")
-                    req.add_header("X-Hub-Signature-256", f"sha256={sig}")
-                    with urllib.request.urlopen(req, timeout=15):
-                        pass
-                except Exception:
-                    pass
-        threading.Thread(target=direct_reply, daemon=True).start()
+            except Exception:
+                pass
+        threading.Thread(target=post, daemon=True).start()
         # 同步写入 QQ 会话 (让 QQ 端也能看到桌面的消息)
         def sync_to_qq():
             try:
@@ -765,64 +720,44 @@ class YingYingLogWindow:
         return status
 
     def _check_g1999(self):
-        """检查重返1999 (雷电模拟器内): 返回 (状态, 详情)"""
-        # 1. 检查模拟器是否运行 (dnplayer 进程)
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-Process dnplayer -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"],
-                capture_output=True, text=True, timeout=10, errors="replace",
-                creationflags=0x08000000 if os.name == "nt" else 0,
-            )
-            emu_running = r.stdout.strip().isdigit() and int(r.stdout.strip()) > 0
-        except Exception:
-            emu_running = False
-        if not emu_running:
-            return "⚪ 空闲", "模拟器未启动"
-        # 2. 模拟器在跑, 检查 1999 游戏 (ADB)
-        try:
-            r2 = subprocess.run(
-                [r"F:\leidian\LDPlayer14\adb.exe", "-s", "emulator-5556",
-                 "shell", "ps", "-A"],
-                capture_output=True, text=True, timeout=10, errors="replace",
-                creationflags=0x08000000 if os.name == "nt" else 0,
-            )
-            if r2 and "reverse1999" in r2.stdout:
-                return "🟢 运行中", "模拟器内游戏运行中"
-            return "🟡 模拟器在线", "游戏未启动"
-        except Exception:
-            return "🟡 模拟器在线", "ADB 未连接"
-        return "⚪ 空闲", ""
+        """检查重返1999 (雷电实例 emulator-5556 内): 返回 (状态, 详情)"""
+        return self._adb_instance_status("emulator-5556", "reverse1999")
 
     def _check_ak(self):
-        """检查明日方舟 (雷电默认实例 emulator-5554): 返回 (状态, 详情)"""
-        # 1. 检查模拟器是否运行 (dnplayer 进程)
+        """检查明日方舟 (雷电实例 emulator-5554 内): 返回 (状态, 详情)"""
+        return self._adb_instance_status("emulator-5554", "arknights")
+
+    def _adb_instance_status(self, serial, pkg_substr):
+        """按 ADB 实例检测模拟器内游戏, 实例间互不混淆: 返回 (状态, 详情)
+        - 对应实例未启动 (ADB 连不上) → ⚪ 空闲, 不再被别的模拟器实例误判
+        - 实例在线但游戏未开 → 🟡 模拟器在线
+        - 游戏运行中 → 🟢 运行中 + PID/启动时间/时长
+        """
+        now = datetime.now()
         try:
             r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-Process dnplayer -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"],
+                [ADB_PATH, "-s", serial, "shell", "ps", "-A", "-o", "PID,ELAPSED,ARGS"],
                 capture_output=True, text=True, timeout=10, errors="replace",
                 creationflags=0x08000000 if os.name == "nt" else 0,
             )
-            emu_running = r.stdout.strip().isdigit() and int(r.stdout.strip()) > 0
         except Exception:
-            emu_running = False
-        if not emu_running:
-            return "⚪ 空闲", "模拟器未启动"
-        # 2. 模拟器在跑, 检查 明日方舟 游戏 (ADB emulator-5554)
-        try:
-            r2 = subprocess.run(
-                [r"F:\leidian\LDPlayer14\adb.exe", "-s", "emulator-5554",
-                 "shell", "ps", "-A"],
-                capture_output=True, text=True, timeout=10, errors="replace",
-                creationflags=0x08000000 if os.name == "nt" else 0,
-            )
-            if r2 and "arknights" in r2.stdout:
-                return "🟢 运行中", "模拟器内游戏运行中"
-            return "🟡 模拟器在线", "游戏未启动"
-        except Exception:
-            return "🟡 模拟器在线", "ADB 未连接"
-        return "⚪ 空闲", ""
+            return "⚪ 空闲", "实例未启动"
+        if r.returncode != 0 or not r.stdout.strip():
+            return "⚪ 空闲", "实例未启动"
+        for ln in r.stdout.splitlines():
+            if pkg_substr not in ln:
+                continue
+            parts = ln.split()
+            if len(parts) >= 2 and parts[0].isdigit():
+                pid, elapsed = parts[0], parts[1]
+                secs = _parse_elapsed(elapsed)
+                if secs is not None:
+                    st = now - timedelta(seconds=secs)
+                    return "🟢 运行中", (f"模拟器内 PID {pid} | 启动 {st.strftime('%H:%M')}"
+                                         f" | {_fmt_duration(secs)}")
+                return "🟢 运行中", f"模拟器内 PID {pid} 运行中"
+            return "🟢 运行中", "模拟器内游戏运行中"
+        return "🟡 模拟器在线", "游戏未启动"
 
     def _check_zzz_mcp(self):
         try:
@@ -929,13 +864,26 @@ class YingYingLogWindow:
         for key, var in self.game_vars.items():
             state = g.get(key, "⚪ 空闲")
             detail = details.get(key, "")
-            if state.startswith("🟢") or state.startswith("🟡"):
+            if state.startswith("🟢"):
                 var.set(f"{state}  {detail}")
-            else:
-                # 空闲状态: 追加上次结束时间
+            elif state.startswith("🟡"):
+                # 模拟器在线但游戏未启动: 显示详情 + 上次结束时间
                 last = self._get_last_end(key)
                 if last:
-                    var.set(f"{state}  上次结束 {last}")
+                    var.set(f"{state}  {detail} | 上次结束 {last}")
+                else:
+                    var.set(f"{state}  {detail}")
+            else:
+                # 空闲状态: 追加上次启动/结束时间
+                parts = []
+                ls = self._get_last_start(key)
+                le = self._get_last_end(key)
+                if ls:
+                    parts.append(f"上次启动 {ls}")
+                if le:
+                    parts.append(f"上次结束 {le}")
+                if parts:
+                    var.set(f"{state}  {' | '.join(parts)}")
                 else:
                     var.set(state)
         try:
@@ -967,28 +915,55 @@ class YingYingLogWindow:
         """获取游戏上次结束时间 (格式: YYYY-MM-DD HH:MM)"""
         try:
             hist = self._load_game_history()
-            ts = hist.get(key)
+            v = hist.get(key)
+            ts = v.get("last_end") if isinstance(v, dict) else v  # 兼容旧格式(纯时间戳)
             if not ts:
                 return ""
-            dt = datetime.fromtimestamp(ts)
-            return dt.strftime("%Y-%m-%d %H:%M")
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ""
+
+    def _get_last_start(self, key):
+        """获取游戏上次启动时间 (格式: YYYY-MM-DD HH:MM)"""
+        try:
+            hist = self._load_game_history()
+            v = hist.get(key)
+            ts = v.get("last_start") if isinstance(v, dict) else None
+            if not ts:
+                return ""
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
         except Exception:
             return ""
 
     def _track_game_ends(self, g):
-        """检测游戏从运行 → 空闲, 记录结束时间"""
+        """检测游戏状态变化, 记录对应游戏的 启动/结束 时间
+        - 只有 🟢 (确认游戏进程在跑) 才算运行中; 🟡 模拟器在线不算
+        - 这样每个模拟器实例独立判定, 游戏从模拟器退出时即记结束时间
+        - 存储升级为 {key: {"last_start": ts, "last_end": ts}}, 兼容旧纯时间戳格式
+        """
         try:
             hist = self._load_game_history()
             now = datetime.now().timestamp()
-            # 各游戏的运行判定 (🟢 或 🟡 算运行中)
-            running_keys = {k for k, v in g.items() if k != "detail"
-                            and (v.startswith("🟢") or v.startswith("🟡"))}
-            # 上次已知运行状态 (保存在实例属性)
+            running_keys = {k for k, v in g.items() if k != "detail" and v.startswith("🟢")}
             prev = getattr(self, "_prev_running", set())
-            ended = prev - running_keys  # 之前运行, 现在不运行
+            started = running_keys - prev  # 新启动
+            ended = prev - running_keys    # 刚结束
+            changed = False
+            for key in started:
+                entry = hist.get(key)
+                if not isinstance(entry, dict):
+                    entry = {}
+                entry["last_start"] = now
+                hist[key] = entry
+                changed = True
             for key in ended:
-                hist[key] = now
-            if ended:
+                entry = hist.get(key)
+                if not isinstance(entry, dict):
+                    entry = {}
+                entry["last_end"] = now
+                hist[key] = entry
+                changed = True
+            if changed:
                 self._save_game_history(hist)
             self._prev_running = running_keys
         except Exception:
@@ -1026,8 +1001,8 @@ class YingYingLogWindow:
             # 只加 TOOLWINDOW (不占任务栏), 不加 TRANSPARENT (否则输入框点不到)
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
                                   style | 0x00000080)
-            # 置底 + 全屏 (注意: 不能带 SWP_NOZORDER=0x0004, 否则置底无效!)
-            user32.SetWindowPos(hwnd, 1, 0, 0, SCREEN_W, SCREEN_H,
+            # 置底 + 占右侧 3/4 (注意: 不能带 SWP_NOZORDER=0x0004, 否则置底无效!)
+            user32.SetWindowPos(hwnd, 1, LEFT_GAP, 0, SCREEN_W - LEFT_GAP, SCREEN_H,
                                 0x0001 | 0x0002 | 0x0010 | 0x0020)
             self.root.update()
             self._desktop_hwnd = hwnd
@@ -1035,7 +1010,7 @@ class YingYingLogWindow:
             def re_bottom(event=None):
                 try:
                     ctypes.windll.user32.SetWindowPos(
-                        self._find_hwnd(), 1, 0, 0, SCREEN_W, SCREEN_H,
+                        self._find_hwnd(), 1, LEFT_GAP, 0, SCREEN_W - LEFT_GAP, SCREEN_H,
                         0x0001 | 0x0002 | 0x0010 | 0x0020)
                 except Exception:
                     pass
@@ -1045,7 +1020,7 @@ class YingYingLogWindow:
             def periodic_bottom():
                 try:
                     ctypes.windll.user32.SetWindowPos(
-                        self._find_hwnd(), 1, 0, 0, SCREEN_W, SCREEN_H,
+                        self._find_hwnd(), 1, LEFT_GAP, 0, SCREEN_W - LEFT_GAP, SCREEN_H,
                         0x0001 | 0x0002 | 0x0010 | 0x0020)
                 except Exception:
                     pass
