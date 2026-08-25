@@ -197,7 +197,20 @@ def check_heartbeat():
 
 
 # ---------- 头像 ----------
+AVATAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatar.png")
+
 def draw_avatar(size=96):
+    """荧荧自画像头像 (avatar.png, 圆形裁剪); 文件缺失时回退像素画"""
+    try:
+        base = Image.open(AVATAR_FILE).convert("RGBA")
+        base = base.resize((size, size), Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        out.paste(base, (0, 0), mask)
+        return out
+    except Exception:
+        pass
     scale = size // 48
     img = Image.new("RGB", (48 * scale, 48 * scale), "#181825")
     d = ImageDraw.Draw(img)

@@ -11,6 +11,7 @@ import re
 import json
 import hashlib
 import sqlite3
+import time
 import subprocess
 import threading
 import tkinter as tk
@@ -275,6 +276,118 @@ def read_chat_history(limit=60):
         return deduped[-limit:]
     except Exception:
         return []
+
+
+# ---------- 回答同步回 QQ 会话 ----------
+# 桌面端的提问会由 send_chat 同步进 QQ 会话, 但荧荧的回复只存在 webhook 会话里;
+# 这里增量把 assistant 回复写回 QQ 会话, 让 QQ 端也能看到完整对话 (2026-08-25 主人要求)
+_qqsync_last_id = 0    # 已同步的最大 webhook assistant 消息 id
+_qqsync_last_ts = 0.0  # 上次执行时间 (限频)
+
+def _strip_thinking(content):
+    """剥离 deepseek 模型残留在 content 里的思考前缀。
+
+    Hermes 存 assistant 消息时, 带工具调用的轮次 content=思考文本;
+    最终回复 (finish_reason='stop') 的 content 大部分是干净回复, 但
+    偶尔模型把一段简短思考也写进来, 以独立 '---' 行与回复分隔 →
+    取第一个 '\n\n---\n\n' 之后的内容 (回复正文里的分隔线不受影响)。
+    """
+    parts = re.split(r"\n\s*---\s*\n", content, maxsplit=1)
+    if len(parts) == 2:
+        return parts[1].strip() or content
+    return content
+
+def sync_assistant_replies_to_qq():
+    """把 48h 内 webhook 会话里荧荧的最终回复, 增量写入 QQ 会话。
+
+    只同步 finish_reason='stop' 且无工具调用的 assistant 消息 (真回复;
+    工具轮次的 content 是思考文本/工具参数, 不写进 QQ 会话)。
+    用消息 id 做水位增量; 进程重启后水位归零会重扫, 但 INSERT 前按
+    (content, 时间差<120s) 查重, 不会重复插入。
+    """
+    global _qqsync_last_id, _qqsync_last_ts
+    now = time.time()
+    if now - _qqsync_last_ts < 10:  # 限频: 至少隔 10 秒跑一次
+        return
+    _qqsync_last_ts = now
+    conn = None
+    try:
+        conn = sqlite3.connect(STATE_DB, timeout=10)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        # 1. 找 QQ 会话 (与 send_chat 的 sync_to_qq 同一套识别)
+        qq = cur.execute(
+            "SELECT id FROM sessions WHERE source LIKE '%qq%' "
+            "ORDER BY last_activity_at DESC LIMIT 1").fetchone()
+        if not qq:
+            return
+        # 2. 48h 内活跃的 webhook 会话 (与 read_chat_history 一致)
+        cutoff = datetime.now().timestamp() - 48 * 3600
+        web_ids = [w["id"] for w in cur.execute(
+            "SELECT id FROM sessions WHERE source='webhook' AND last_activity_at > ? "
+            "ORDER BY last_activity_at DESC LIMIT 30", (cutoff,)).fetchall()]
+        if not web_ids:
+            return
+        # 3. 增量拉取: id 大于上次水位 的最终回复 (stop + 无工具调用)
+        ph = ",".join("?" * len(web_ids))
+        rows = cur.execute(
+            f"SELECT id, content, timestamp FROM messages "
+            f"WHERE session_id IN ({ph}) AND role='assistant' AND content IS NOT NULL "
+            f"AND finish_reason='stop' AND (tool_calls IS NULL OR tool_calls='') "
+            f"AND id > ? ORDER BY id", (*web_ids, _qqsync_last_id)).fetchall()
+        if not rows:
+            return
+        # 4. 查 QQ 会话已有 assistant 内容, 防重启重扫重复插入
+        existing = cur.execute(
+            "SELECT content, timestamp FROM messages "
+            "WHERE session_id=? AND role='assistant'", (qq["id"],)).fetchall()
+        def _is_dup(content, ts):
+            for e in existing:
+                try:
+                    ets = e["timestamp"]
+                    if isinstance(ets, (int, float)) and ets > 1e12:
+                        ets = ets / 1000.0
+                    if e["content"] == content and abs(ets - ts) < 120:
+                        return True
+                except Exception:
+                    continue
+            return False
+        inserted = 0
+        max_id = _qqsync_last_id
+        for r in rows:
+            content = _strip_thinking(r["content"] or "")
+            if not content:
+                continue
+            ts = r["timestamp"]
+            if not ts:
+                continue
+            try:
+                if isinstance(ts, (int, float)):
+                    if ts > 1e12:
+                        ts = ts / 1000.0
+                else:
+                    ts = float(ts)
+            except Exception:
+                continue
+            if _is_dup(content, ts):
+                continue
+            cur.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp, active, observed) "
+                "VALUES (?, 'assistant', ?, ?, 1, 0)", (qq["id"], content, ts))
+            existing.append({"content": content, "timestamp": ts})  # 同批内也防重
+            inserted += 1
+            max_id = max(max_id, r["id"])
+        if inserted:
+            conn.commit()
+        _qqsync_last_id = max_id
+    except Exception:
+        pass
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 
 # ---------- 心跳 ----------
@@ -1230,6 +1343,10 @@ class YingYingLogWindow:
                     f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {e}\n{traceback.format_exc()}\n")
             except Exception:
                 pass
+        try:
+            sync_assistant_replies_to_qq()  # 荧荧回复增量写回 QQ 会话 (内部限频 10s)
+        except Exception:
+            pass
         self.root.after(REFRESH_MS, self.auto_refresh)
 
     def run(self):

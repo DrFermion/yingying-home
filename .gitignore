@@ -12,3 +12,6 @@ log_window/backups/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 聊天图片（含主人隐私，不进仓库）
+chat_images/
