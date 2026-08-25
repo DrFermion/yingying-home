@@ -16,6 +16,7 @@ import threading
 import tkinter as tk
 from datetime import datetime, timedelta
 from io import BytesIO
+import urllib.request as urllib_request
 from PIL import Image, ImageDraw, ImageTk
 
 LOG_DIR = os.path.expandvars(r"%LOCALAPPDATA%\hermes\logs")
@@ -28,6 +29,63 @@ REFRESH_MS = 3000
 SCREEN_W, SCREEN_H = 2560, 1440
 LEFT_GAP = SCREEN_W // 4  # 屏幕左侧 1/4 留给桌面图标, 窗口占右侧 3/4
 TRANSPARENT = "#010203"  # 透明色 (桌面图标透过显示)
+CHAT_IMG_DIR = r"E:\yingying-home\chat_images"  # 主人发来的图片存放目录
+IMG_CACHE_DIR = os.path.expandvars(r"%LOCALAPPDATA%\hermes\image_cache")  # URL 图片缓存
+IMG_MAX_W = 220  # 聊天区缩略图最大宽度 (px)
+
+
+def _parse_img_marks(text):
+    """提取消息里的图片标记 → (清洗后的文本, [图片路径/URL...])
+
+    支持三种标记:
+    - [图片:路径或URL] / [img:...] / [image:...]   (荧荧自定义约定)
+    - MEDIA: 路径或URL                              (Hermes 附件语法)
+    - 裸图片 URL (png/jpg/gif/webp/bmp 结尾)
+    """
+    marks = []
+
+    def grab(m):
+        p = m.group(1).strip().strip('"').strip("'")
+        if p:
+            marks.append(p)
+        return "🖼️"
+
+    t = re.sub(r"\[(?:图片|img|image)\s*[:：]\s*([^\]]+)\]", grab, text)
+    t = re.sub(r"MEDIA\s*[:：]\s*(\S+)", grab, t, flags=re.I)
+
+    def grab_url(m):
+        u = m.group(0)
+        marks.append(u)
+        return "🖼️"
+
+    t = re.sub(r"https?://\S+?\.(?:png|jpe?g|gif|webp|bmp)(?:\?\S*)?", grab_url, t, flags=re.I)
+    return t, marks
+
+
+def _load_chat_image(src, max_w=IMG_MAX_W):
+    """从本地路径或 URL 加载图片并缩放到 max_w 宽; 失败返回 None"""
+    try:
+        local = src
+        if src.startswith(("http://", "https://")):
+            name = hashlib.md5(src.encode("utf-8")).hexdigest()[:16] + ".img"
+            cache = os.path.join(IMG_CACHE_DIR, name)
+            if not os.path.exists(cache):
+                os.makedirs(IMG_CACHE_DIR, exist_ok=True)
+                req = urllib_request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib_request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                with open(cache, "wb") as f:
+                    f.write(data)
+            local = cache
+        if not os.path.exists(local):
+            return None
+        img = Image.open(local).convert("RGBA")
+        w, h = img.size
+        if w > max_w:
+            img = img.resize((max_w, max(1, int(h * max_w / w))), Image.LANCZOS)
+        return img
+    except Exception:
+        return None
 
 
 def _parse_elapsed(s):
@@ -135,8 +193,13 @@ def _clean_msg(m, webhook=False):
     if webhook and m["role"] == "user" and content.startswith("主人从桌面操作台发来消息"):
         content = content.replace("主人从桌面操作台发来消息", "", 1).strip()
         content = content.lstrip(":：-–—").strip()
-        # 只保留第一行 (消息本体), 去掉换行后的任何提示词/模板尾巴
-        content = content.split("\n")[0].strip()
+        # 只保留第一行 (消息本体) + 含图片标记的行 (去掉换行后的任何提示词/模板尾巴)
+        lines = content.split("\n")
+        kept = [lines[0]]
+        for ln in lines[1:]:
+            if "[图片" in ln or "MEDIA" in ln.upper() or re.search(r"https?://\S+?\.(?:png|jpe?g|gif|webp|bmp)", ln, re.I):
+                kept.append(ln)
+        content = "\n".join(kept).strip()
         if not content:
             return None
     ts = m["timestamp"]
@@ -176,15 +239,18 @@ def read_chat_history(limit=60):
                 item = _clean_msg(m)
                 if item:
                     merged.append(item)
-        # 2. 近 30 分钟内活跃的 webhook 会话 (桌面端对话; 每条桌面消息会开新会话, 全部合并才不丢回复)
-        cutoff = datetime.now().timestamp() - 1800
-        for w in conn.execute(
+        # 2. 48小时内活跃的 webhook 会话 (桌面端对话; 回复只在 webhook 会话里!
+        #    旧版 30 分钟窗口 → 超过 30 分钟的桌面对话回复全部从面板消失, 只剩 QQ 里的提问, 2026-08-25 修复)
+        cutoff = datetime.now().timestamp() - 48 * 3600
+        web_ids = [w["id"] for w in conn.execute(
                 "SELECT id FROM sessions WHERE source='webhook' AND last_activity_at > ? "
-                "ORDER BY last_activity_at DESC LIMIT 10", (cutoff,)).fetchall():
+                "ORDER BY last_activity_at DESC LIMIT 30", (cutoff,)).fetchall()]
+        if web_ids:
+            ph = ",".join("?" * len(web_ids))
             msgs = conn.execute(
-                'SELECT role, content, timestamp FROM messages '
-                'WHERE session_id=? AND role IN ("user","assistant") AND content IS NOT NULL '
-                'ORDER BY id DESC LIMIT ?', (w["id"], limit * 2)
+                f'SELECT role, content, timestamp FROM messages '
+                f'WHERE session_id IN ({ph}) AND role IN ("user","assistant") AND content IS NOT NULL '
+                f'ORDER BY id DESC LIMIT ?', (*web_ids, limit * 4)
             ).fetchall()
             for m in reversed(msgs):
                 item = _clean_msg(m, webhook=True)
@@ -230,7 +296,20 @@ def check_heartbeat():
 
 
 # ---------- 头像 ----------
+AVATAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatar.png")
+
 def draw_avatar(size=96):
+    """荧荧自画像头像 (avatar.png, 圆形裁剪); 文件缺失时回退像素画"""
+    try:
+        base = Image.open(AVATAR_FILE).convert("RGBA")
+        base = base.resize((size, size), Image.LANCZOS)
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
+        out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        out.paste(base, (0, 0), mask)
+        return out
+    except Exception:
+        pass
     scale = size // 48
     img = Image.new("RGB", (48 * scale, 48 * scale), "#181825")
     d = ImageDraw.Draw(img)
@@ -322,6 +401,8 @@ class YingYingLogWindow:
         self._follow_bottom = True
         self._bg_running = False
         self._chat_loaded = 0
+        self._chat_photos = []    # 聊天区 PhotoImage 引用 (防止被 GC)
+        self._pending_images = []  # 待发送的图片路径
 
         self._build_columns()
 
@@ -433,20 +514,31 @@ class YingYingLogWindow:
         self.chat.tag_configure("assistant", foreground="#a6e3a1")
         self.chat.tag_configure("time", foreground="#6c7086", font=("Microsoft YaHei UI", 8))
         self.chat.tag_configure("sep", foreground="#313244")
+        # 挂载图片提示 (输入框上方)
+        self._pending_label = tk.Label(chat_area, text="", bg=TRANSPARENT, fg="#fab387",
+                                       font=("Microsoft YaHei UI", 9))
+        self._pending_label.pack(anchor="w", padx=14, pady=(0, 2))
         # 输入区 (不透明背景, 否则透明色区域点击穿透无法选中)
         input_frame = tk.Frame(chat_area, bg="#181825")
         input_frame.pack(fill="x", side="bottom", pady=8, padx=10)
+        tk.Button(input_frame, text="📎", command=self._pick_image,
+                  bg="#313244", fg="#a6adc8", relief="flat", cursor="hand2",
+                  font=("Microsoft YaHei UI", 13), activebackground="#45475a",
+                  bd=0, padx=10, pady=4).pack(side="left", padx=(0, 6))
         self.chat_input = tk.Entry(input_frame, bg="#11111b", fg="#cdd6f4",
                                    font=("Microsoft YaHei UI", 11), insertbackground="#cdd6f4",
                                    relief="flat", bd=0, highlightthickness=1,
                                    highlightbackground="#313244", highlightcolor="#f5a0c0")
         self.chat_input.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
         self.chat_input.bind("<Return>", lambda e: self.send_chat())
+        self.chat_input.bind("<Control-v>", self._paste_image)
+        self.chat_input.bind("<Control-V>", self._paste_image)
         tk.Button(input_frame, text="发送", command=self.send_chat,
                   bg="#f5a0c0", fg="#1e1e2e", relief="flat", activebackground="#f28bb8",
                   font=("Microsoft YaHei UI", 11, "bold"), cursor="hand2",
                   bd=0, padx=16, pady=6).pack(side="left")
-        tk.Label(chat_area, text="(输入后发送, 荧荧会记在心里~)", bg=TRANSPARENT, fg="#6c7086",
+        tk.Label(chat_area, text="(输入后发送, 荧荧会记在心里~ 📎 可发图片, Ctrl+V 粘贴截图)",
+                 bg=TRANSPARENT, fg="#6c7086",
                  font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=14, pady=(0, 4))
 
         # ===== 栏1 (中): 游戏 + 零食 =====
@@ -567,6 +659,7 @@ class YingYingLogWindow:
             self._chat_fp = fingerprint
             self.chat.configure(state="normal")
             self.chat.delete("1.0", tk.END)
+            self._chat_photos.clear()  # 清掉旧图片引用, 防止重建时内存堆积
             for msg in history:
                 self._append_chat(msg)
             self.chat.configure(state="disabled")
@@ -582,29 +675,115 @@ class YingYingLogWindow:
         content = msg["content"]
         # 保留换行, 不截断 (长消息完整显示, 聊天框自动换行)
         t = msg.get("time", "")
+        text, marks = _parse_img_marks(content)
         if role == "user":
             self.chat.insert(tk.END, f"  {t}\n", "time")
-            self.chat.insert(tk.END, f"👤 主人: {content}\n", "user")
+            self.chat.insert(tk.END, "👤 主人: ", "user")
         else:
             self.chat.insert(tk.END, f"  {t}\n", "time")
-            self.chat.insert(tk.END, f"🤖 荧荧: {content}\n", "assistant")
+            self.chat.insert(tk.END, "🤖 荧荧: ", "assistant")
+        self.chat.insert(tk.END, text, role)
+        self.chat.insert(tk.END, "\n")
+        # 图片: 依次加载并插入 (缩略图, 保持纵横比)
+        for src in marks:
+            img = _load_chat_image(src)
+            if img is not None:
+                try:
+                    photo = ImageTk.PhotoImage(img)
+                    self._chat_photos.append(photo)  # 保持引用防 GC
+                    self.chat.image_create(tk.END, image=photo)
+                    self.chat.insert(tk.END, " ")
+                except Exception:
+                    self.chat.insert(tk.END, f"[图片显示失败]\n", "time")
+            else:
+                self.chat.insert(tk.END, f"[图片加载失败: {src[:60]}]\n", "time")
         self.chat.insert(tk.END, "─" * 30 + "\n", "sep")
 
+    # ---------- 图片发送 ----------
+    def _pick_image(self):
+        """📎 按钮: 文件对话框选图挂载"""
+        from tkinter import filedialog
+        try:
+            f = filedialog.askopenfilename(
+                title="选择图片发给荧荧",
+                filetypes=[("图片", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                           ("所有文件", "*.*")])
+            if f:
+                self._add_pending_image(f)
+        except Exception:
+            pass
+
+    def _paste_image(self, e=None):
+        """Ctrl+V: 剪贴板里的图片或图片文件路径 → 挂载"""
+        try:
+            from PIL import ImageGrab
+            data = ImageGrab.grabclipboard()
+            if isinstance(data, Image.Image):
+                self._add_pending_image(data)
+                return "break"
+            if isinstance(data, (list, tuple)):
+                ok = False
+                for f in data:
+                    if isinstance(f, str) and f.lower().endswith(
+                            (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
+                        self._add_pending_image(f)
+                        ok = True
+                if ok:
+                    return "break"
+        except Exception:
+            pass
+        return None
+
+    def _add_pending_image(self, img):
+        """挂载图片 (PIL Image 或本地路径): 保存/复制到 CHAT_IMG_DIR"""
+        try:
+            os.makedirs(CHAT_IMG_DIR, exist_ok=True)
+            path = os.path.join(CHAT_IMG_DIR,
+                                datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19] + ".png")
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(path)
+                self._pending_images.append(path)
+            elif isinstance(img, str) and os.path.exists(img):
+                try:
+                    Image.open(img).convert("RGB").save(path)
+                    self._pending_images.append(path)
+                except Exception:
+                    self._pending_images.append(img)  # 转换失败就用原路径
+            self._update_pending_label()
+        except Exception:
+            pass
+
+    def _update_pending_label(self):
+        try:
+            n = len(self._pending_images)
+            if n:
+                self._pending_label.config(
+                    text=f"📎 已挂载 {n} 张图片, 发送后一起给荧荧~ (Ctrl+V 可继续粘贴)")
+            else:
+                self._pending_label.config(text="")
+        except Exception:
+            pass
+
     def send_chat(self):
-        """输入框发送: 本地显示 + 通过 webhook 发给荧荧"""
+        """输入框发送: 本地显示 + 通过 webhook 发给荧荧 (文字 + 图片)"""
         text = self.chat_input.get().strip()
-        if not text:
+        imgs = list(self._pending_images)
+        if not text and not imgs:
             return
         self.chat_input.delete(0, tk.END)
-        # 本地追加显示
-        self.chat.configure(state="normal")
         now = datetime.now().strftime("%H:%M")
-        self.chat.insert(tk.END, f"  {now}\n", "time")
-        self.chat.insert(tk.END, f"👤 主人: {text}\n", "user")
-        self.chat.insert(tk.END, "─" * 30 + "\n", "sep")
+        # 拼 webhook 消息: 图片用 [图片:路径] 标记, 荧荧看到会用视觉模型看
+        payload_text = text
+        for p in imgs:
+            payload_text += f"\n[图片:{p}]"
+        # 本地追加显示 (带缩略图)
+        self.chat.configure(state="normal")
+        self._append_chat({"role": "user", "content": payload_text, "time": now})
         self.chat.configure(state="disabled")
         self.chat.see(tk.END)
         self._chat_loaded += 1
+        self._pending_images.clear()
+        self._update_pending_label()
         # 通过 webhook 发给荧荧 (agent 模式, 有完整工具权限)
         def post():
             try:
@@ -613,7 +792,7 @@ class YingYingLogWindow:
                 import json as _json
                 import urllib.request
                 secret = "RDITjtnGZFulO1IIax63xQbURdXksUkaO79WqwnEAn4"
-                payload = _json.dumps({"message": text}).encode()
+                payload = _json.dumps({"message": payload_text}).encode()
                 sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
                 req = urllib.request.Request(
                     "http://localhost:8644/webhooks/desktop-chat",
@@ -640,7 +819,7 @@ class YingYingLogWindow:
                     cur.execute(
                         "INSERT INTO messages (session_id, role, content, timestamp, active, observed) "
                         "VALUES (?, 'user', ?, ?, 1, 0)",
-                        (qq_sid, text, datetime.now().timestamp()))
+                        (qq_sid, payload_text, datetime.now().timestamp()))
                     conn.commit()
                 conn.close()
             except Exception:
@@ -650,7 +829,7 @@ class YingYingLogWindow:
         try:
             path = os.path.join(LOG_DIR, "yingying_chat_log.txt")
             with open(path, "a", encoding="utf-8") as f:
-                f.write(f"[{now}] 主人: {text}\n")
+                f.write(f"[{now}] 主人: {payload_text}\n")
         except Exception:
             pass
 
